@@ -1,5 +1,3 @@
-// +build linux
-
 package cgroups
 
 import (
@@ -7,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -15,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/opencontainers/runc/libcontainer/userns"
+	"github.com/moby/sys/userns"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/sys/unix"
 )
@@ -23,11 +20,14 @@ import (
 const (
 	CgroupProcesses   = "cgroup.procs"
 	unifiedMountpoint = "/sys/fs/cgroup"
+	hybridMountpoint  = "/sys/fs/cgroup/unified"
 )
 
 var (
 	isUnifiedOnce sync.Once
 	isUnified     bool
+	isHybridOnce  sync.Once
+	isHybrid      bool
 )
 
 // IsCgroup2UnifiedMode returns whether we are running in cgroup v2 unified mode.
@@ -36,17 +36,35 @@ func IsCgroup2UnifiedMode() bool {
 		var st unix.Statfs_t
 		err := unix.Statfs(unifiedMountpoint, &st)
 		if err != nil {
+			level := logrus.WarnLevel
 			if os.IsNotExist(err) && userns.RunningInUserNS() {
-				// ignore the "not found" error if running in userns
-				logrus.WithError(err).Debugf("%s missing, assuming cgroup v1", unifiedMountpoint)
-				isUnified = false
-				return
+				// For rootless containers, sweep it under the rug.
+				level = logrus.DebugLevel
 			}
-			panic(fmt.Sprintf("cannot statfs cgroup root: %s", err))
+			logrus.StandardLogger().Logf(level,
+				"statfs %s: %v; assuming cgroup v1", unifiedMountpoint, err)
 		}
 		isUnified = st.Type == unix.CGROUP2_SUPER_MAGIC
 	})
 	return isUnified
+}
+
+// IsCgroup2HybridMode returns whether we are running in cgroup v2 hybrid mode.
+func IsCgroup2HybridMode() bool {
+	isHybridOnce.Do(func() {
+		var st unix.Statfs_t
+		err := unix.Statfs(hybridMountpoint, &st)
+		if err != nil {
+			isHybrid = false
+			if !os.IsNotExist(err) {
+				// Report unexpected errors.
+				logrus.WithError(err).Debugf("statfs(%q) failed", hybridMountpoint)
+			}
+			return
+		}
+		isHybrid = st.Type == unix.CGROUP2_SUPER_MAGIC
+	})
+	return isHybrid
 }
 
 type Mount struct {
@@ -118,18 +136,18 @@ func GetAllSubsystems() ([]string, error) {
 	return subsystems, nil
 }
 
-func readProcsFile(file string) ([]int, error) {
-	f, err := os.Open(file)
+func readProcsFile(dir string) (out []int, _ error) {
+	file := CgroupProcesses
+	retry := true
+
+again:
+	f, err := OpenFile(dir, file, os.O_RDONLY)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
 
-	var (
-		s   = bufio.NewScanner(f)
-		out = []int{}
-	)
-
+	s := bufio.NewScanner(f)
 	for s.Scan() {
 		if t := s.Text(); t != "" {
 			pid, err := strconv.Atoi(t)
@@ -139,13 +157,22 @@ func readProcsFile(file string) ([]int, error) {
 			out = append(out, pid)
 		}
 	}
+	if errors.Is(s.Err(), unix.ENOTSUP) && retry {
+		// For a threaded cgroup, read returns ENOTSUP, and we should
+		// read from cgroup.threads instead.
+		file = "cgroup.threads"
+		retry = false
+		goto again
+	}
 	return out, s.Err()
 }
 
 // ParseCgroupFile parses the given cgroup file, typically /proc/self/cgroup
 // or /proc/<pid>/cgroup, into a map of subsystems to cgroup paths, e.g.
-//   "cpu": "/user.slice/user-1000.slice"
-//   "pids": "/user.slice/user-1000.slice"
+//
+//	"cpu": "/user.slice/user-1000.slice"
+//	"pids": "/user.slice/user-1000.slice"
+//
 // etc.
 //
 // Note that for cgroup v2 unified hierarchy, there are no per-controller
@@ -197,21 +224,26 @@ func PathExists(path string) bool {
 	return true
 }
 
-func EnterPid(cgroupPaths map[string]string, pid int) error {
-	for _, path := range cgroupPaths {
-		if PathExists(path) {
-			if err := WriteCgroupProc(path, pid); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
+// rmdir tries to remove a directory, optionally retrying on EBUSY.
+func rmdir(path string, retry bool) error {
+	delay := time.Millisecond
+	tries := 10
 
-func rmdir(path string) error {
+again:
 	err := unix.Rmdir(path)
-	if err == nil || err == unix.ENOENT {
+	switch err { // nolint:errorlint // unix errors are bare
+	case nil, unix.ENOENT:
 		return nil
+	case unix.EINTR:
+		goto again
+	case unix.EBUSY:
+		if retry && tries > 0 {
+			time.Sleep(delay)
+			delay *= 2
+			tries--
+			goto again
+
+		}
 	}
 	return &os.PathError{Op: "rmdir", Path: path, Err: err}
 }
@@ -219,105 +251,98 @@ func rmdir(path string) error {
 // RemovePath aims to remove cgroup path. It does so recursively,
 // by removing any subdirectories (sub-cgroups) first.
 func RemovePath(path string) error {
-	// try the fast path first
-	if err := rmdir(path); err == nil {
+	// Try the fast path first.
+	if err := rmdir(path, false); err == nil {
 		return nil
 	}
 
-	infos, err := ioutil.ReadDir(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			err = nil
-		}
+	infos, err := os.ReadDir(path)
+	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
 	for _, info := range infos {
 		if info.IsDir() {
-			// We should remove subcgroups dir first
+			// We should remove subcgroup first.
 			if err = RemovePath(filepath.Join(path, info.Name())); err != nil {
 				break
 			}
 		}
 	}
 	if err == nil {
-		err = rmdir(path)
+		err = rmdir(path, true)
 	}
 	return err
 }
 
 // RemovePaths iterates over the provided paths removing them.
-// We trying to remove all paths five times with increasing delay between tries.
-// If after all there are not removed cgroups - appropriate error will be
-// returned.
 func RemovePaths(paths map[string]string) (err error) {
-	const retries = 5
-	delay := 10 * time.Millisecond
-	for i := 0; i < retries; i++ {
-		if i != 0 {
-			time.Sleep(delay)
-			delay *= 2
+	for s, p := range paths {
+		if err := RemovePath(p); err == nil {
+			delete(paths, s)
 		}
-		for s, p := range paths {
-			if err := RemovePath(p); err != nil {
-				// do not log intermediate iterations
-				switch i {
-				case 0:
-					logrus.WithError(err).Warnf("Failed to remove cgroup (will retry)")
-				case retries - 1:
-					logrus.WithError(err).Error("Failed to remove cgroup")
-				}
-			}
-			_, err := os.Stat(p)
-			// We need this strange way of checking cgroups existence because
-			// RemoveAll almost always returns error, even on already removed
-			// cgroups
-			if os.IsNotExist(err) {
-				delete(paths, s)
-			}
-		}
-		if len(paths) == 0 {
-			//nolint:ineffassign,staticcheck // done to help garbage collecting: opencontainers/runc#2506
-			paths = make(map[string]string)
-			return nil
-		}
+	}
+	if len(paths) == 0 {
+		clear(paths)
+		return nil
 	}
 	return fmt.Errorf("Failed to remove paths: %v", paths)
 }
 
-func GetHugePageSize() ([]string, error) {
-	dir, err := os.OpenFile("/sys/kernel/mm/hugepages", unix.O_DIRECTORY|unix.O_RDONLY, 0)
-	if err != nil {
-		return nil, err
-	}
-	files, err := dir.Readdirnames(0)
-	dir.Close()
-	if err != nil {
-		return nil, err
-	}
+var (
+	hugePageSizes []string
+	initHPSOnce   sync.Once
+)
 
-	return getHugePageSizeFromFilenames(files)
+func HugePageSizes() []string {
+	initHPSOnce.Do(func() {
+		dir, err := os.OpenFile("/sys/kernel/mm/hugepages", unix.O_DIRECTORY|unix.O_RDONLY, 0)
+		if err != nil {
+			return
+		}
+		files, err := dir.Readdirnames(0)
+		dir.Close()
+		if err != nil {
+			return
+		}
+
+		hugePageSizes, err = getHugePageSizeFromFilenames(files)
+		if err != nil {
+			logrus.Warn("HugePageSizes: ", err)
+		}
+	})
+
+	return hugePageSizes
 }
 
 func getHugePageSizeFromFilenames(fileNames []string) ([]string, error) {
 	pageSizes := make([]string, 0, len(fileNames))
+	var warn error
 
 	for _, file := range fileNames {
 		// example: hugepages-1048576kB
 		val := strings.TrimPrefix(file, "hugepages-")
 		if len(val) == len(file) {
-			// unexpected file name: no prefix found
+			// Unexpected file name: no prefix found, ignore it.
 			continue
 		}
-		// The suffix is always "kB" (as of Linux 5.9)
+		// The suffix is always "kB" (as of Linux 5.13). If we find
+		// something else, produce an error but keep going.
 		eLen := len(val) - 2
 		val = strings.TrimSuffix(val, "kB")
 		if len(val) != eLen {
-			logrus.Warnf("GetHugePageSize: %s: invalid filename suffix (expected \"kB\")", file)
+			// Highly unlikely.
+			if warn == nil {
+				warn = errors.New(file + `: invalid suffix (expected "kB")`)
+			}
 			continue
 		}
 		size, err := strconv.Atoi(val)
 		if err != nil {
-			return nil, err
+			// Highly unlikely.
+			if warn == nil {
+				warn = fmt.Errorf("%s: %w", file, err)
+			}
+			continue
 		}
 		// Model after https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/mm/hugetlb_cgroup.c?id=eff48ddeab782e35e58ccc8853f7386bbae9dec4#n574
 		// but in our case the size is in KB already.
@@ -331,34 +356,12 @@ func getHugePageSizeFromFilenames(fileNames []string) ([]string, error) {
 		pageSizes = append(pageSizes, val)
 	}
 
-	return pageSizes, nil
+	return pageSizes, warn
 }
 
 // GetPids returns all pids, that were added to cgroup at path.
 func GetPids(dir string) ([]int, error) {
-	return readProcsFile(filepath.Join(dir, CgroupProcesses))
-}
-
-// GetAllPids returns all pids, that were added to cgroup at path and to all its
-// subcgroups.
-func GetAllPids(path string) ([]int, error) {
-	var pids []int
-	// collect pids from all sub-cgroups
-	err := filepath.Walk(path, func(p string, info os.FileInfo, iErr error) error {
-		if iErr != nil {
-			return iErr
-		}
-		if info.IsDir() || info.Name() != CgroupProcesses {
-			return nil
-		}
-		cPids, err := readProcsFile(p)
-		if err != nil {
-			return err
-		}
-		pids = append(pids, cPids...)
-		return nil
-	})
-	return pids, err
+	return readProcsFile(dir)
 }
 
 // WriteCgroupProc writes the specified pid into the cgroup's cgroup.procs file
@@ -376,7 +379,7 @@ func WriteCgroupProc(dir string, pid int) error {
 
 	file, err := OpenFile(dir, CgroupProcesses, os.O_WRONLY)
 	if err != nil {
-		return fmt.Errorf("failed to write %v to %v: %v", pid, CgroupProcesses, err)
+		return fmt.Errorf("failed to write %v: %w", pid, err)
 	}
 	defer file.Close()
 
@@ -393,7 +396,7 @@ func WriteCgroupProc(dir string, pid int) error {
 			continue
 		}
 
-		return fmt.Errorf("failed to write %v to %v: %v", pid, CgroupProcesses, err)
+		return fmt.Errorf("failed to write %v: %w", pid, err)
 	}
 	return err
 }
@@ -446,5 +449,5 @@ func ConvertBlkIOToIOWeightValue(blkIoWeight uint16) uint64 {
 	if blkIoWeight == 0 {
 		return 0
 	}
-	return uint64(1 + (uint64(blkIoWeight)-10)*9999/990)
+	return 1 + (uint64(blkIoWeight)-10)*9999/990
 }

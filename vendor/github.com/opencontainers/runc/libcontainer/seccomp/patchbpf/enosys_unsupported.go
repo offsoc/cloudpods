@@ -1,3 +1,3 @@
-// +build !linux !cgo !seccomp
+//go:build !linux || !cgo || !seccomp
 
 package patchbpf

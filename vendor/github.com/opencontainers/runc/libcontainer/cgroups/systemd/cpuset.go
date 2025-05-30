@@ -1,12 +1,10 @@
 package systemd
 
 import (
-	"encoding/binary"
+	"errors"
+	"math/big"
 	"strconv"
 	"strings"
-
-	"github.com/bits-and-blooms/bitset"
-	"github.com/pkg/errors"
 )
 
 // RangeToBits converts a text representation of a CPU mask (as written to
@@ -14,7 +12,7 @@ import (
 // with the corresponding bits set (as consumed by systemd over dbus as
 // AllowedCPUs/AllowedMemoryNodes unit property value).
 func RangeToBits(str string) ([]byte, error) {
-	bits := &bitset.BitSet{}
+	bits := new(big.Int)
 
 	for _, r := range strings.Split(str, ",") {
 		// allow extra spaces around
@@ -23,45 +21,40 @@ func RangeToBits(str string) ([]byte, error) {
 		if r == "" {
 			continue
 		}
-		ranges := strings.SplitN(r, "-", 2)
-		if len(ranges) > 1 {
-			start, err := strconv.ParseUint(ranges[0], 10, 32)
+		startr, endr, ok := strings.Cut(r, "-")
+		if ok {
+			start, err := strconv.ParseUint(startr, 10, 32)
 			if err != nil {
 				return nil, err
 			}
-			end, err := strconv.ParseUint(ranges[1], 10, 32)
+			end, err := strconv.ParseUint(endr, 10, 32)
 			if err != nil {
 				return nil, err
 			}
 			if start > end {
 				return nil, errors.New("invalid range: " + r)
 			}
-			for i := uint(start); i <= uint(end); i++ {
-				bits.Set(i)
+			for i := start; i <= end; i++ {
+				bits.SetBit(bits, int(i), 1)
 			}
 		} else {
-			val, err := strconv.ParseUint(ranges[0], 10, 32)
+			val, err := strconv.ParseUint(startr, 10, 32)
 			if err != nil {
 				return nil, err
 			}
-			bits.Set(uint(val))
+			bits.SetBit(bits, int(val), 1)
 		}
 	}
 
-	val := bits.Bytes()
-	if len(val) == 0 {
+	ret := bits.Bytes()
+	if len(ret) == 0 {
 		// do not allow empty values
 		return nil, errors.New("empty value")
 	}
-	ret := make([]byte, len(val)*8)
-	for i := range val {
-		// bitset uses BigEndian internally
-		binary.BigEndian.PutUint64(ret[i*8:], val[len(val)-1-i])
-	}
-	// remove upper all-zero bytes
-	for ret[0] == 0 {
-		ret = ret[1:]
-	}
 
+	// fit cpuset parsing order in systemd
+	for l, r := 0, len(ret)-1; l < r; l, r = l+1, r-1 {
+		ret[l], ret[r] = ret[r], ret[l]
+	}
 	return ret, nil
 }

@@ -1,11 +1,12 @@
-// +build linux
-
 package fs2
 
 import (
 	"bufio"
+	"errors"
 	"os"
 	"strconv"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/opencontainers/runc/libcontainer/cgroups"
 	"github.com/opencontainers/runc/libcontainer/cgroups/fscommon"
@@ -13,12 +14,18 @@ import (
 )
 
 func isCpuSet(r *configs.Resources) bool {
-	return r.CpuWeight != 0 || r.CpuQuota != 0 || r.CpuPeriod != 0
+	return r.CpuWeight != 0 || r.CpuQuota != 0 || r.CpuPeriod != 0 || r.CPUIdle != nil || r.CpuBurst != nil
 }
 
 func setCpu(dirPath string, r *configs.Resources) error {
 	if !isCpuSet(r) {
 		return nil
+	}
+
+	if r.CPUIdle != nil {
+		if err := cgroups.WriteFile(dirPath, "cpu.idle", strconv.FormatInt(*r.CPUIdle, 10)); err != nil {
+			return err
+		}
 	}
 
 	// NOTE: .CpuShares is not used here. Conversion is the caller's responsibility.
@@ -28,6 +35,23 @@ func setCpu(dirPath string, r *configs.Resources) error {
 		}
 	}
 
+	var burst string
+	if r.CpuBurst != nil {
+		burst = strconv.FormatUint(*r.CpuBurst, 10)
+		if err := cgroups.WriteFile(dirPath, "cpu.max.burst", burst); err != nil {
+			// Sometimes when the burst to be set is larger
+			// than the current one, it is rejected by the kernel
+			// (EINVAL) as old_quota/new_burst exceeds the parent
+			// cgroup quota limit. If this happens and the quota is
+			// going to be set, ignore the error for now and retry
+			// after setting the quota.
+			if !errors.Is(err, unix.EINVAL) || r.CpuQuota == 0 {
+				return err
+			}
+		} else {
+			burst = ""
+		}
+	}
 	if r.CpuQuota != 0 || r.CpuPeriod != 0 {
 		str := "max"
 		if r.CpuQuota > 0 {
@@ -43,13 +67,19 @@ func setCpu(dirPath string, r *configs.Resources) error {
 		if err := cgroups.WriteFile(dirPath, "cpu.max", str); err != nil {
 			return err
 		}
+		if burst != "" {
+			if err := cgroups.WriteFile(dirPath, "cpu.max.burst", burst); err != nil {
+				return err
+			}
+		}
 	}
 
 	return nil
 }
 
 func statCpu(dirPath string, stats *cgroups.Stats) error {
-	f, err := cgroups.OpenFile(dirPath, "cpu.stat", os.O_RDONLY)
+	const file = "cpu.stat"
+	f, err := cgroups.OpenFile(dirPath, file, os.O_RDONLY)
 	if err != nil {
 		return err
 	}
@@ -59,7 +89,7 @@ func statCpu(dirPath string, stats *cgroups.Stats) error {
 	for sc.Scan() {
 		t, v, err := fscommon.ParseKeyValue(sc.Text())
 		if err != nil {
-			return err
+			return &parseError{Path: dirPath, File: file, Err: err}
 		}
 		switch t {
 		case "usage_usec":
@@ -80,6 +110,9 @@ func statCpu(dirPath string, stats *cgroups.Stats) error {
 		case "throttled_usec":
 			stats.CpuStats.ThrottlingData.ThrottledTime = v * 1000
 		}
+	}
+	if err := sc.Err(); err != nil {
+		return &parseError{Path: dirPath, File: file, Err: err}
 	}
 	return nil
 }
