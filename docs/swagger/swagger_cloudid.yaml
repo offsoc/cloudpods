@@ -37,10 +37,6 @@ definitions:
                     user:rd: op
                 type: object
                 x-go-name: Metadata
-            cloudaccount_id:
-                description: 'swagger: ignore'
-                type: string
-                x-go-name: CloudaccountId
             cloudpolicy_ids:
                 description: 权限Id列表, 权限provider必须和权限组provider一致
                 items:
@@ -1854,6 +1850,11 @@ paths:
                   name: show_fail_reason
                   type: boolean
                   x-go-name: ShowFailReason
+                - description: 是否返回状态统计信息，默认为False
+                  in: query
+                  name: summary_stats
+                  type: boolean
+                  x-go-name: SummaryStats
                 - $ref: '#/definitions/TTagSet'
                   description: 通过标签过滤（包含这些标签）
                   in: query
@@ -1975,11 +1976,6 @@ paths:
                   name: status
                   type: array
                   x-go-name: Status
-                - description: 根据云账号名称过滤资源
-                  in: query
-                  name: cloudaccount
-                  type: string
-                  x-go-name: Cloudaccount
                 - description: 根据平台过滤
                   in: query
                   items:
@@ -1987,6 +1983,10 @@ paths:
                   name: provider
                   type: array
                   x-go-name: Provider
+                - in: query
+                  name: cloudaccount_id
+                  type: string
+                  x-go-name: CloudaccountId
                 - description: 根据云订阅过滤资源
                   in: query
                   name: manager_id
@@ -2827,6 +2827,11 @@ paths:
                   name: show_fail_reason
                   type: boolean
                   x-go-name: ShowFailReason
+                - description: 是否返回状态统计信息，默认为False
+                  in: query
+                  name: summary_stats
+                  type: boolean
+                  x-go-name: SummaryStats
                 - $ref: '#/definitions/TTagSet'
                   description: 通过标签过滤（包含这些标签）
                   in: query
@@ -2948,11 +2953,10 @@ paths:
                   name: status
                   type: array
                   x-go-name: Status
-                - description: 根据云账号名称过滤资源
-                  in: query
-                  name: cloudaccount
+                - in: query
+                  name: cloudaccount_id
                   type: string
-                  x-go-name: Cloudaccount
+                  x-go-name: CloudaccountId
                 - description: 根据平台过滤
                   in: query
                   items:
@@ -3573,6 +3577,11 @@ paths:
                   name: show_fail_reason
                   type: boolean
                   x-go-name: ShowFailReason
+                - description: 是否返回状态统计信息，默认为False
+                  in: query
+                  name: summary_stats
+                  type: boolean
+                  x-go-name: SummaryStats
                 - $ref: '#/definitions/TTagSet'
                   description: 通过标签过滤（包含这些标签）
                   in: query
@@ -3694,11 +3703,6 @@ paths:
                   name: status
                   type: array
                   x-go-name: Status
-                - description: 根据云账号名称过滤资源
-                  in: query
-                  name: cloudaccount
-                  type: string
-                  x-go-name: Cloudaccount
                 - description: 根据平台过滤
                   in: query
                   items:
@@ -3706,6 +3710,10 @@ paths:
                   name: provider
                   type: array
                   x-go-name: Provider
+                - in: query
+                  name: cloudaccount_id
+                  type: string
+                  x-go-name: CloudaccountId
                 - description: 根据云订阅过滤资源
                   in: query
                   name: manager_id
@@ -4399,6 +4407,11 @@ paths:
                   name: show_fail_reason
                   type: boolean
                   x-go-name: ShowFailReason
+                - description: 是否返回状态统计信息，默认为False
+                  in: query
+                  name: summary_stats
+                  type: boolean
+                  x-go-name: SummaryStats
                 - $ref: '#/definitions/TTagSet'
                   description: 通过标签过滤（包含这些标签）
                   in: query
@@ -4515,11 +4528,6 @@ paths:
                   name: user_id
                   type: string
                   x-go-name: UserId
-                - description: 根据云账号名称过滤资源
-                  in: query
-                  name: cloudaccount
-                  type: string
-                  x-go-name: Cloudaccount
                 - description: 根据平台过滤
                   in: query
                   items:
@@ -4527,6 +4535,10 @@ paths:
                   name: provider
                   type: array
                   x-go-name: Provider
+                - in: query
+                  name: cloudaccount_id
+                  type: string
+                  x-go-name: CloudaccountId
                 - description: 根据云订阅过滤资源
                   in: query
                   name: manager_id
@@ -5358,6 +5370,11 @@ paths:
                   name: show_fail_reason
                   type: boolean
                   x-go-name: ShowFailReason
+                - description: 是否返回状态统计信息，默认为False
+                  in: query
+                  name: summary_stats
+                  type: boolean
+                  x-go-name: SummaryStats
                 - $ref: '#/definitions/TTagSet'
                   description: 通过标签过滤（包含这些标签）
                   in: query
@@ -5479,11 +5496,6 @@ paths:
                   name: status
                   type: array
                   x-go-name: Status
-                - description: 根据云账号名称过滤资源
-                  in: query
-                  name: cloudaccount
-                  type: string
-                  x-go-name: Cloudaccount
                 - description: 根据平台过滤
                   in: query
                   items:
@@ -5491,6 +5503,10 @@ paths:
                   name: provider
                   type: array
                   x-go-name: Provider
+                - in: query
+                  name: cloudaccount_id
+                  type: string
+                  x-go-name: CloudaccountId
                 - description: 根据云订阅过滤资源
                   in: query
                   name: manager_id
@@ -6129,6 +6145,11 @@ paths:
                   name: show_fail_reason
                   type: boolean
                   x-go-name: ShowFailReason
+                - description: 是否返回状态统计信息，默认为False
+                  in: query
+                  name: summary_stats
+                  type: boolean
+                  x-go-name: SummaryStats
                 - $ref: '#/definitions/TTagSet'
                   description: 通过标签过滤（包含这些标签）
                   in: query
@@ -6250,11 +6271,6 @@ paths:
                   name: cloudgroup_id
                   type: string
                   x-go-name: CloudgroupId
-                - description: 根据云账号名称过滤资源
-                  in: query
-                  name: cloudaccount
-                  type: string
-                  x-go-name: Cloudaccount
                 - description: 根据平台过滤
                   in: query
                   items:
@@ -6262,6 +6278,10 @@ paths:
                   name: provider
                   type: array
                   x-go-name: Provider
+                - in: query
+                  name: cloudaccount_id
+                  type: string
+                  x-go-name: CloudaccountId
             responses:
                 "200":
                     $ref: '#/responses/samluser_ListItemFilterOutput'

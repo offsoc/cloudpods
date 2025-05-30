@@ -1069,7 +1069,7 @@ func (s *sPodGuestInstance) PostLoad(m *SGuestManager) error {
 	return LoadGuestCpuset(m, s)
 }
 
-func (s *sPodGuestInstance) SyncConfig(ctx context.Context, guestDesc *desc.SGuestDesc, fwOnly bool) (jsonutils.JSONObject, error) {
+func (s *sPodGuestInstance) SyncConfig(ctx context.Context, guestDesc *desc.SGuestDesc, fwOnly, setUefiBootOrder bool) (jsonutils.JSONObject, error) {
 	if err := SaveDesc(s, guestDesc); err != nil {
 		return nil, errors.Wrap(err, "SaveDesc")
 	}
@@ -2203,6 +2203,9 @@ func (s *sPodGuestInstance) tarGzDir(input *hostapi.ContainerSaveVolumeMountToIm
 		dirPath = strings.Join(input.VolumeMountDirs, " ")
 	}
 	cmd := fmt.Sprintf("tar -czf %s -C %s %s", outputFp, hostPath, dirPath)
+	if input.VolumeMountPrefix != "" {
+		cmd += fmt.Sprintf(" --transform 's,^,%s/,'", input.VolumeMountPrefix)
+	}
 	if out, err := procutils.NewRemoteCommandAsFarAsPossible("sh", "-c", cmd).Output(); err != nil {
 		return "", errors.Wrapf(err, "%s: %s", cmd, out)
 	}
@@ -2460,7 +2463,7 @@ func (s *sPodGuestInstance) tarHostDir(srcDir, targetPath string,
 	if len(includeFiles) > 0 {
 		includeStr = strings.Join(includeFiles, " ")
 	}
-	cmd := fmt.Sprintf("%s --warning=no-file-changed --ignore-failed-read -cf %s -C %s %s", baseCmd, targetPath, srcDir, includeStr)
+	cmd := fmt.Sprintf("%s --ignore-failed-read -cf %s -C %s %s", baseCmd, targetPath, srcDir, includeStr)
 	log.Infof("[%s] tar cmd: %s", s.GetName(), cmd)
 	if out, err := procutils.NewRemoteCommandAsFarAsPossible("sh", "-c", cmd).Output(); err != nil {
 		outErr := errors.Wrapf(err, "%s: %s", cmd, out)
