@@ -1,4 +1,4 @@
-// +build linux
+//go:build linux
 
 package capabilities
 
@@ -34,6 +34,17 @@ func init() {
 	}
 }
 
+// KnownCapabilities returns the list of the known capabilities.
+// Used by `runc features`.
+func KnownCapabilities() []string {
+	list := capability.List()
+	res := make([]string, len(list))
+	for i, c := range list {
+		res[i] = "CAP_" + strings.ToUpper(c.String())
+	}
+	return res
+}
+
 // New creates a new Caps from the given Capabilities config. Unknown Capabilities
 // or Capabilities that are unavailable in the current environment are ignored,
 // printing a warning instead.
@@ -52,9 +63,6 @@ func New(capConfig *configs.Capabilities) (*Caps, error) {
 		capability.AMBIENT:     capSlice(capConfig.Ambient, unknownCaps),
 	}
 	if c.pid, err = capability.NewPid2(0); err != nil {
-		return nil, err
-	}
-	if err = c.pid.Load(); err != nil {
 		return nil, err
 	}
 	if len(unknownCaps) > 0 {

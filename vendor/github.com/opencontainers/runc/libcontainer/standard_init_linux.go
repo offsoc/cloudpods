@@ -1,31 +1,32 @@
-// +build linux
-
 package libcontainer
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
-	"runtime"
-	"strconv"
+
+	"github.com/opencontainers/runtime-spec/specs-go"
+	"github.com/opencontainers/selinux/go-selinux"
+	"github.com/sirupsen/logrus"
+	"golang.org/x/sys/unix"
 
 	"github.com/opencontainers/runc/libcontainer/apparmor"
 	"github.com/opencontainers/runc/libcontainer/configs"
 	"github.com/opencontainers/runc/libcontainer/keys"
 	"github.com/opencontainers/runc/libcontainer/seccomp"
 	"github.com/opencontainers/runc/libcontainer/system"
-	"github.com/opencontainers/runtime-spec/specs-go"
-	"github.com/opencontainers/selinux/go-selinux"
-	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
-	"golang.org/x/sys/unix"
+	"github.com/opencontainers/runc/libcontainer/utils"
 )
 
 type linuxStandardInit struct {
-	pipe          *os.File
+	pipe          *syncSocket
 	consoleSocket *os.File
+	pidfdSocket   *os.File
 	parentPid     int
-	fifoFd        int
-	logFd         int
+	fifoFile      *os.File
+	logPipe       *os.File
+	dmzExe        *os.File
 	config        *initConfig
 }
 
@@ -42,12 +43,10 @@ func (l *linuxStandardInit) getSessionRingParams() (string, uint32, uint32) {
 
 	// Create a unique per session container name that we can join in setns;
 	// However, other containers can also join it.
-	return "_ses." + l.config.ContainerId, 0xffffffff, newperms
+	return "_ses." + l.config.ContainerID, 0xffffffff, newperms
 }
 
 func (l *linuxStandardInit) Init() error {
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
 	if !l.config.Config.NoNewKeyring {
 		if err := selinux.SetKeyLabel(l.config.ProcessLabel); err != nil {
 			return err
@@ -65,15 +64,15 @@ func (l *linuxStandardInit) Init() error {
 			//
 			// TODO(cyphar): Log this so people know what's going on, once we
 			//               have proper logging in 'runc init'.
-			if errors.Cause(err) != unix.ENOSYS {
-				return errors.Wrap(err, "join session keyring")
+			if !errors.Is(err, unix.ENOSYS) {
+				return fmt.Errorf("unable to join session keyring: %w", err)
 			}
 		} else {
-			// Make session keyring searcheable. If we've gotten this far we
+			// Make session keyring searchable. If we've gotten this far we
 			// bail on any error -- we don't want to have a keyring with bad
 			// permissions.
 			if err := keys.ModKeyringPerm(sessKeyId, keepperms, newperms); err != nil {
-				return errors.Wrap(err, "mod keyring permissions")
+				return fmt.Errorf("unable to mod keyring permissions: %w", err)
 			}
 		}
 	}
@@ -87,9 +86,12 @@ func (l *linuxStandardInit) Init() error {
 
 	// initialises the labeling system
 	selinux.GetEnabled()
-	if err := prepareRootfs(l.pipe, l.config); err != nil {
+
+	err := prepareRootfs(l.pipe, l.config)
+	if err != nil {
 		return err
 	}
+
 	// Set up the console. This has to be done *before* we finalize the rootfs,
 	// but *after* we've given the user the chance to set up all of the mounts
 	// they wanted.
@@ -98,7 +100,13 @@ func (l *linuxStandardInit) Init() error {
 			return err
 		}
 		if err := system.Setctty(); err != nil {
-			return errors.Wrap(err, "setctty")
+			return &os.SyscallError{Syscall: "ioctl(setctty)", Err: err}
+		}
+	}
+
+	if l.pidfdSocket != nil {
+		if err := setupPidfd(l.pidfdSocket, "standard"); err != nil {
+			return fmt.Errorf("failed to setup pidfd: %w", err)
 		}
 	}
 
@@ -111,52 +119,74 @@ func (l *linuxStandardInit) Init() error {
 
 	if hostname := l.config.Config.Hostname; hostname != "" {
 		if err := unix.Sethostname([]byte(hostname)); err != nil {
-			return errors.Wrap(err, "sethostname")
+			return &os.SyscallError{Syscall: "sethostname", Err: err}
+		}
+	}
+	if domainname := l.config.Config.Domainname; domainname != "" {
+		if err := unix.Setdomainname([]byte(domainname)); err != nil {
+			return &os.SyscallError{Syscall: "setdomainname", Err: err}
 		}
 	}
 	if err := apparmor.ApplyProfile(l.config.AppArmorProfile); err != nil {
-		return errors.Wrap(err, "apply apparmor profile")
+		return fmt.Errorf("unable to apply apparmor profile: %w", err)
 	}
 
 	for key, value := range l.config.Config.Sysctl {
 		if err := writeSystemProperty(key, value); err != nil {
-			return errors.Wrapf(err, "write sysctl key %s", key)
+			return err
 		}
 	}
 	for _, path := range l.config.Config.ReadonlyPaths {
 		if err := readonlyPath(path); err != nil {
-			return errors.Wrapf(err, "readonly path %s", path)
+			return fmt.Errorf("can't make %q read-only: %w", path, err)
 		}
 	}
 	for _, path := range l.config.Config.MaskPaths {
 		if err := maskPath(path, l.config.Config.MountLabel); err != nil {
-			return errors.Wrapf(err, "mask path %s", path)
+			return fmt.Errorf("can't mask path %s: %w", path, err)
 		}
 	}
 	pdeath, err := system.GetParentDeathSignal()
 	if err != nil {
-		return errors.Wrap(err, "get pdeath signal")
+		return fmt.Errorf("can't get pdeath signal: %w", err)
 	}
 	if l.config.NoNewPrivileges {
 		if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
-			return errors.Wrap(err, "set nonewprivileges")
+			return &os.SyscallError{Syscall: "prctl(SET_NO_NEW_PRIVS)", Err: err}
 		}
 	}
-	// Tell our parent that we're ready to Execv. This must be done before the
+
+	if l.config.Config.Scheduler != nil {
+		if err := setupScheduler(l.config.Config); err != nil {
+			return err
+		}
+	}
+	if l.config.Config.IOPriority != nil {
+		if err := setIOPriority(l.config.Config.IOPriority); err != nil {
+			return err
+		}
+	}
+
+	// Tell our parent that we're ready to exec. This must be done before the
 	// Seccomp rules have been applied, because we need to be able to read and
 	// write to a socket.
 	if err := syncParentReady(l.pipe); err != nil {
-		return errors.Wrap(err, "sync ready")
+		return fmt.Errorf("sync ready: %w", err)
 	}
 	if err := selinux.SetExecLabel(l.config.ProcessLabel); err != nil {
-		return errors.Wrap(err, "set process label")
+		return fmt.Errorf("can't set process label: %w", err)
 	}
 	defer selinux.SetExecLabel("") //nolint: errcheck
 	// Without NoNewPrivileges seccomp is a privileged operation, so we need to
 	// do this before dropping capabilities; otherwise do it as late as possible
 	// just before execve so as few syscalls take place after it as possible.
 	if l.config.Config.Seccomp != nil && !l.config.NoNewPrivileges {
-		if err := seccomp.InitSeccomp(l.config.Config.Seccomp); err != nil {
+		seccompFd, err := seccomp.InitSeccomp(l.config.Config.Seccomp)
+		if err != nil {
+			return err
+		}
+
+		if err := syncParentSeccomp(l.pipe, seccompFd); err != nil {
 			return err
 		}
 	}
@@ -166,7 +196,7 @@ func (l *linuxStandardInit) Init() error {
 	// finalizeNamespace can change user/group which clears the parent death
 	// signal, so we restore it here.
 	if err := pdeath.Restore(); err != nil {
-		return errors.Wrap(err, "restore pdeath signal")
+		return fmt.Errorf("can't restore pdeath signal: %w", err)
 	}
 	// Compare the parent from the initial start of the init process and make
 	// sure that it did not change.  if the parent changes that means it died
@@ -181,51 +211,91 @@ func (l *linuxStandardInit) Init() error {
 	if err != nil {
 		return err
 	}
+
+	// Set seccomp as close to execve as possible, so as few syscalls take
+	// place afterward (reducing the amount of syscalls that users need to
+	// enable in their seccomp profiles). However, this needs to be done
+	// before closing the pipe since we need it to pass the seccompFd to
+	// the parent.
+	if l.config.Config.Seccomp != nil && l.config.NoNewPrivileges {
+		seccompFd, err := seccomp.InitSeccomp(l.config.Config.Seccomp)
+		if err != nil {
+			return fmt.Errorf("unable to init seccomp: %w", err)
+		}
+
+		if err := syncParentSeccomp(l.pipe, seccompFd); err != nil {
+			return err
+		}
+	}
+
+	// Set personality if specified.
+	if l.config.Config.Personality != nil {
+		if err := setupPersonality(l.config.Config); err != nil {
+			return err
+		}
+	}
+
 	// Close the pipe to signal that we have completed our init.
 	logrus.Debugf("init: closing the pipe to signal completion")
 	_ = l.pipe.Close()
 
 	// Close the log pipe fd so the parent's ForwardLogs can exit.
-	if err := unix.Close(l.logFd); err != nil {
-		return newSystemErrorWithCause(err, "closing log pipe fd")
+	logrus.Debugf("init: about to wait on exec fifo")
+	if err := l.logPipe.Close(); err != nil {
+		return fmt.Errorf("close log pipe: %w", err)
 	}
+
+	fifoPath, closer := utils.ProcThreadSelfFd(l.fifoFile.Fd())
+	defer closer()
 
 	// Wait for the FIFO to be opened on the other side before exec-ing the
 	// user process. We open it through /proc/self/fd/$fd, because the fd that
 	// was given to us was an O_PATH fd to the fifo itself. Linux allows us to
 	// re-open an O_PATH fd through /proc.
-	fd, err := unix.Open("/proc/self/fd/"+strconv.Itoa(l.fifoFd), unix.O_WRONLY|unix.O_CLOEXEC, 0)
+	fd, err := unix.Open(fifoPath, unix.O_WRONLY|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return newSystemErrorWithCause(err, "open exec fifo")
+		return &os.PathError{Op: "open exec fifo", Path: fifoPath, Err: err}
 	}
 	if _, err := unix.Write(fd, []byte("0")); err != nil {
-		return newSystemErrorWithCause(err, "write 0 exec fifo")
+		return &os.PathError{Op: "write exec fifo", Path: fifoPath, Err: err}
 	}
+
 	// Close the O_PATH fifofd fd before exec because the kernel resets
 	// dumpable in the wrong order. This has been fixed in newer kernels, but
 	// we keep this to ensure CVE-2016-9962 doesn't re-emerge on older kernels.
 	// N.B. the core issue itself (passing dirfds to the host filesystem) has
 	// since been resolved.
 	// https://github.com/torvalds/linux/blob/v4.9/fs/exec.c#L1290-L1318
-	_ = unix.Close(l.fifoFd)
-	// Set seccomp as close to execve as possible, so as few syscalls take
-	// place afterward (reducing the amount of syscalls that users need to
-	// enable in their seccomp profiles).
-	if l.config.Config.Seccomp != nil && l.config.NoNewPrivileges {
-		if err := seccomp.InitSeccomp(l.config.Config.Seccomp); err != nil {
-			return newSystemErrorWithCause(err, "init seccomp")
-		}
-	}
+	_ = l.fifoFile.Close()
 
 	s := l.config.SpecState
 	s.Pid = unix.Getpid()
 	s.Status = specs.StateCreated
-	if err := l.config.Config.Hooks[configs.StartContainer].RunHooks(s); err != nil {
+	if err := l.config.Config.Hooks.Run(configs.StartContainer, s); err != nil {
 		return err
 	}
 
-	if err := system.Exec(name, l.config.Args[0:], os.Environ()); err != nil {
-		return newSystemErrorWithCause(err, "exec user process")
+	if l.dmzExe != nil {
+		l.config.Args[0] = name
+		return system.Fexecve(l.dmzExe.Fd(), l.config.Args, os.Environ())
 	}
-	return nil
+	// Close all file descriptors we are not passing to the container. This is
+	// necessary because the execve target could use internal runc fds as the
+	// execve path, potentially giving access to binary files from the host
+	// (which can then be opened by container processes, leading to container
+	// escapes). Note that because this operation will close any open file
+	// descriptors that are referenced by (*os.File) handles from underneath
+	// the Go runtime, we must not do any file operations after this point
+	// (otherwise the (*os.File) finaliser could close the wrong file). See
+	// CVE-2024-21626 for more information as to why this protection is
+	// necessary.
+	//
+	// This is not needed for runc-dmz, because the extra execve(2) step means
+	// that all O_CLOEXEC file descriptors have already been closed and thus
+	// the second execve(2) from runc-dmz cannot access internal file
+	// descriptors from runc.
+	if err := utils.UnsafeCloseFrom(l.config.PassedFilesCount + 3); err != nil {
+		return err
+	}
+	return system.Exec(name, l.config.Args, os.Environ())
 }

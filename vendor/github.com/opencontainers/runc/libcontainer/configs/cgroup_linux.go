@@ -28,17 +28,26 @@ type Cgroup struct {
 	// ScopePrefix describes prefix for the scope name
 	ScopePrefix string `json:"scope_prefix"`
 
-	// Paths represent the absolute cgroups paths to join.
-	// This takes precedence over Path.
-	Paths map[string]string
-
 	// Resources contains various cgroups settings to apply
 	*Resources
+
+	// Systemd tells if systemd should be used to manage cgroups.
+	Systemd bool
 
 	// SystemdProps are any additional properties for systemd,
 	// derived from org.systemd.property.xxx annotations.
 	// Ignored unless systemd is used for managing cgroups.
 	SystemdProps []systemdDbus.Property `json:"-"`
+
+	// Rootless tells if rootless cgroups should be used.
+	Rootless bool
+
+	// The host UID that should own the cgroup, or nil to accept
+	// the default ownership.  This should only be set when the
+	// cgroupfs is to be mounted read/write.
+	// Not all cgroup manager implementations support changing
+	// the ownership.
+	OwnerUID *int `json:"owner_uid,omitempty"`
 }
 
 type Resources struct {
@@ -60,6 +69,9 @@ type Resources struct {
 	// CPU hardcap limit (in usecs). Allowed cpu time in a given period.
 	CpuQuota int64 `json:"cpu_quota"`
 
+	// CPU hardcap burst limit (in usecs). Allowed accumulated cpu time additionally for burst in a given period.
+	CpuBurst *uint64 `json:"cpu_burst"` //nolint:revive
+
 	// CPU period to be used for hardcapping (in usecs). 0 to use system default.
 	CpuPeriod uint64 `json:"cpu_period"`
 
@@ -74,6 +86,9 @@ type Resources struct {
 
 	// MEM to use
 	CpusetMems string `json:"cpuset_mems"`
+
+	// cgroup SCHED_IDLE
+	CPUIdle *int64 `json:"cpu_idle,omitempty"`
 
 	// Process limit; set <= `0' to disable limit.
 	PidsLimit int64 `json:"pids_limit"`
@@ -117,6 +132,9 @@ type Resources struct {
 	// Set class identifier for container's network packets
 	NetClsClassid uint32 `json:"net_cls_classid_u"`
 
+	// Rdma resource restriction configuration
+	Rdma map[string]LinuxRdma `json:"rdma"`
+
 	// Used on cgroups v2:
 
 	// CpuWeight sets a proportional bandwidth limit.
@@ -143,4 +161,9 @@ type Resources struct {
 	// during Set() to figure out whether the freeze is required. Those
 	// methods may be relatively slow, thus this flag.
 	SkipFreezeOnSet bool `json:"-"`
+
+	// MemoryCheckBeforeUpdate is a flag for cgroup v2 managers to check
+	// if the new memory limits (Memory and MemorySwap) being set are lower
+	// than the current memory usage, and reject if so.
+	MemoryCheckBeforeUpdate bool `json:"memory_check_before_update"`
 }
